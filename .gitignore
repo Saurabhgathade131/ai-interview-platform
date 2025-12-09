@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+venv/
+__pycache__/
+
+# Environment variables
+.env
+.env.local
+.env.production
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Documentation (Internal)
+dev_docs/

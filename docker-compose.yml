@@ -1,0 +1,111 @@
+version: '3.8'
+
+services:
+  server:
+    image: judge0/judge0:1.13.1
+    ports:
+      - "2358:2358"
+    privileged: true
+    restart: always
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://judge0:judge0@db:5432/judge0
+      - POSTGRES_HOST=db
+      - POSTGRES_URL=postgres://judge0:judge0@db:5432/judge0
+      - POSTGRES_DB=judge0
+      - POSTGRES_USER=judge0
+      - POSTGRES_PASSWORD=judge0
+      - ENABLE_WAIT_RESULT=true
+      - ENABLE_COMPILER_OPTIONS=true
+      - MAINTENANCE_MODE=false
+      - ENABLE_PER_PROCESS_AND_THREAD_TIME_LIMIT=false
+      - ENABLE_PER_PROCESS_AND_THREAD_MEMORY_LIMIT=false
+      - USE_ADVANCED_EXECUTION_CONTROL=false
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    shm_size: '256m'
+    tmpfs:
+      - /tmp:exec,mode=1777
+      - /box:exec,mode=0777
+
+  workers:
+    image: judge0/judge0:1.13.1
+    command: [ "./scripts/workers" ]
+    privileged: true
+    restart: always
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://judge0:judge0@db:5432/judge0
+      - POSTGRES_HOST=db
+      - POSTGRES_URL=postgres://judge0:judge0@db:5432/judge0
+      - POSTGRES_DB=judge0
+      - POSTGRES_USER=judge0
+      - POSTGRES_PASSWORD=judge0
+      - ENABLE_WAIT_RESULT=true
+      - ENABLE_COMPILER_OPTIONS=true
+      - MAINTENANCE_MODE=false
+      - ENABLE_PER_PROCESS_AND_THREAD_TIME_LIMIT=false
+      - ENABLE_PER_PROCESS_AND_THREAD_MEMORY_LIMIT=false
+      - USE_ADVANCED_EXECUTION_CONTROL=false
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    shm_size: '256m'
+    tmpfs:
+      - /tmp:exec,mode=1777
+      - /box:exec,mode=0777
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+
+  db:
+    image: postgres:13.0
+    restart: always
+    environment:
+      - POSTGRES_DB=judge0
+      - POSTGRES_USER=judge0
+      - POSTGRES_PASSWORD=judge0
+      - POSTGRES_HOST_AUTH_METHOD=trust
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U judge0 -d judge0" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:6.0
+    command: [ "redis-server", "--appendonly", "yes" ]
+    restart: always
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    deploy:
+      resources:
+        limits:
+          cpus: '2.00'
+          memory: 3G
+    restart: always
+
+volumes:
+  postgres-data:
+  redis-data:
+  ollama:
