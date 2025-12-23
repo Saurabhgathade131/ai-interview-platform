@@ -20,3 +20,10 @@ yarn-error.log*
 
 # Documentation (Internal)
 dev_docs/
+
+# Markdown files (except README.md)
+*.md
+!README.md
+
+# Text logs
+*.txt

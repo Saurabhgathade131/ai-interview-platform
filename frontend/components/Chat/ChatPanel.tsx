@@ -1,13 +1,16 @@
 /**
  * Chat Panel Component
  * Displays conversation with AI interviewer
+ * TTS: Azure Jenny Neural (high quality)
+ * STT: Browser Web Speech API (fast, no network call)
  */
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { Bot, User, Send, Lightbulb, Mic, MicOff, Volume2, AlertCircle } from 'lucide-react';
+import { Bot, User, Send, Lightbulb, Mic, MicOff, AlertCircle } from 'lucide-react';
 import { ChatMessage } from '@/types';
 import { formatTime, cn } from '@/lib/utils';
+import { stopSpeech } from '@/lib/speech';
 
 interface ChatPanelProps {
     messages: ChatMessage[];
@@ -16,207 +19,106 @@ interface ChatPanelProps {
 }
 
 export default function ChatPanel({ messages, onSendMessage, isLoading = false }: ChatPanelProps) {
-    const [inputValue, setInputValue] = React.useState('');
+    const [inputValue, setInputValue] = useState('');
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
-    // Voice State
-    const [isVoiceMode, setIsVoiceMode] = React.useState(false);
-    const [isListening, setIsListening] = React.useState(false);
-    const [isSpeaking, setIsSpeaking] = React.useState(false);
-    const [selectedVoice, setSelectedVoice] = React.useState<SpeechSynthesisVoice | null>(null);
-    const [highlightIndex, setHighlightIndex] = useState<number>(0);
+    // Voice State - using browser Web Speech API for STT
+    const [isListening, setIsListening] = useState(false);
+    const [speechSupported, setSpeechSupported] = useState(false);
 
-    // Refs for persistence across renders
+    // Speech recognition ref
     const recognitionRef = useRef<any>(null);
-    const synthesisRef = useRef<SpeechSynthesis | null>(null);
     const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-    // Initialize Speech Services & Load Voices
+    // Initialize browser Speech Recognition
     useEffect(() => {
         if (typeof window !== 'undefined') {
-            synthesisRef.current = window.speechSynthesis;
-
-            // Load voices
-            const loadVoices = () => {
-                const voices = window.speechSynthesis.getVoices();
-                // Prefer Google US English or a female voice for better clarity
-                const preferredVoice = voices.find(v =>
-                    v.name.includes('Google US English') ||
-                    v.name.includes('Samantha') ||
-                    v.lang === 'en-US'
-                );
-                if (preferredVoice) setSelectedVoice(preferredVoice);
-            };
-
-            loadVoices();
-            window.speechSynthesis.onvoiceschanged = loadVoices;
-
-            // Setup Speech Recognition
             const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
             if (SpeechRecognition) {
+                setSpeechSupported(true);
                 const recognition = new SpeechRecognition();
-                recognition.continuous = true; // Keep listening 
-                recognition.interimResults = true; // Required for faster interruption detection
+                recognition.continuous = false;
+                recognition.interimResults = true;
                 recognition.lang = 'en-US';
 
-                recognition.onstart = () => setIsListening(true);
+                recognition.onstart = () => {
+                    setIsListening(true);
+                    // Stop any AI speech when user starts speaking
+                    stopSpeech();
+                };
 
                 recognition.onend = () => {
                     setIsListening(false);
-                    // Auto-restart if in voice mode AND AI is NOT speaking
-                    // This prevents the loop where recognition restarts during AI speech
-                    if (isVoiceMode && !window.speechSynthesis.speaking) {
-                        try {
-                            recognition.start();
-                        } catch (e) { /* Already started */ }
-                    }
                 };
 
-                // Detect speech
                 recognition.onresult = (event: any) => {
-                    // 1. Handle Interruption: Stop AI if it's speaking
-                    if (window.speechSynthesis.speaking) {
-                        window.speechSynthesis.cancel();
-                        setIsSpeaking(false);
-                        setHighlightIndex(0);
-                    }
-
-                    // 2. Process Result
                     const result = event.results[event.results.length - 1];
                     const transcript = result[0].transcript;
 
-                    // REAL-TIME INPUT UPDATE
+                    // Update input in real-time
                     setInputValue(transcript);
 
-                    // Reset silence timer on every new word
-                    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+                    // Clear any existing silence timer
+                    if (silenceTimerRef.current) {
+                        clearTimeout(silenceTimerRef.current);
+                    }
 
                     if (result.isFinal) {
-                        // Send immediately if final
-                        if (transcript.trim()) {
-                            onSendMessage(transcript.trim());
-                            setInputValue(''); // Clear after sending
-                        }
-                    } else {
-                        // VAD: If 1.2s silence during interim results, assume finished (Reduced from 1.5s for better responsiveness)
+                        // Auto-send after 1.5 second delay when speech is final
                         silenceTimerRef.current = setTimeout(() => {
-                            recognition.stop();
                             if (transcript.trim()) {
                                 onSendMessage(transcript.trim());
-                                setInputValue(''); // Clear after sending
+                                setInputValue('');
                             }
-                        }, 1200);
+                        }, 1500);
                     }
+                };
+
+                recognition.onerror = (event: any) => {
+                    console.warn('Speech recognition error:', event.error);
+                    setIsListening(false);
                 };
 
                 recognitionRef.current = recognition;
             }
         }
-    }, [isVoiceMode, onSendMessage]);
 
-    // Handle Voice Mode Toggling
-    const toggleVoiceMode = () => {
-        if (isVoiceMode) {
-            setIsVoiceMode(false);
-            synthesisRef.current?.cancel();
-            recognitionRef.current?.stop();
-            setIsSpeaking(false);
-            setHighlightIndex(0);
-        } else {
-            setIsVoiceMode(true);
-            try {
-                recognitionRef.current?.start();
-            } catch (e) {
-                console.error("Failed to start recognition", e);
+        return () => {
+            if (silenceTimerRef.current) {
+                clearTimeout(silenceTimerRef.current);
             }
-        }
-    };
-
-    // Speak incoming AI messages
-    useEffect(() => {
-        const lastMessage = messages[messages.length - 1];
-
-        // Ensure strictly only the AI speaks and we are in voice mode
-        if (isVoiceMode && lastMessage?.role === 'assistant' && synthesisRef.current) {
-            // Cancel previous speech
-            synthesisRef.current.cancel();
-
-            // Prepare text
-            const textToSpeak = lastMessage.content
-                .replace(/```[\s\S]*?```/g, " I've written some code for you to check. ") // Friendly replacement
-                .replace(/[*_`]/g, "");
-
-            const utterance = new SpeechSynthesisUtterance(textToSpeak);
-
-            if (selectedVoice) {
-                utterance.voice = selectedVoice;
-            }
-
-            utterance.rate = 1.1; // Slightly faster for natural feel
-            utterance.pitch = 1.0;
-
-            utterance.onstart = () => {
-                setIsSpeaking(true);
-                setHighlightIndex(0);
-                // CRITICAL: Stop listening while AI speaks to prevent self-loop
-                if (isListening && recognitionRef.current) {
-                    recognitionRef.current.stop();
-                }
-            };
-
-            utterance.onend = () => {
-                setIsSpeaking(false);
-                setHighlightIndex(0);
-                // Resume listening only if we are still in voice mode
-                if (isVoiceMode && recognitionRef.current) {
-                    try {
-                        recognitionRef.current.start();
-                    } catch (e) { /* Already started */ }
-                }
-            };
-
-            // Karaoke Effect: Track word boundaries
-            utterance.onboundary = (event) => {
-                if (event.name === 'word') {
-                    setHighlightIndex(event.charIndex);
-                }
-            };
-
-            synthesisRef.current.speak(utterance);
-        }
-    }, [messages, isVoiceMode, selectedVoice, isListening]); // Added isListening to deps
+        };
+    }, [onSendMessage]);
 
     // Auto-scroll to bottom
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [messages, highlightIndex]); // Also scroll on highlight update
+    }, [messages]);
+
+    // Toggle speech recognition
+    const toggleListening = () => {
+        if (!recognitionRef.current) return;
+
+        if (isListening) {
+            recognitionRef.current.stop();
+        } else {
+            try {
+                recognitionRef.current.start();
+            } catch (e) {
+                console.warn('Recognition already started');
+            }
+        }
+    };
 
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
         if (inputValue.trim() && !isLoading) {
+            // Stop any AI speech when user sends a message
+            stopSpeech();
             onSendMessage(inputValue.trim());
             setInputValue('');
         }
-    };
-
-    // Helper to render text with highlights
-    const renderMessageContent = (content: string, isSpeakingThis: boolean) => {
-        if (!isSpeakingThis || !isVoiceMode) return <div className="text-sm whitespace-pre-wrap">{content}</div>;
-
-        // Simple approach: Split string into spoken (past) and current/future
-        // Note: charIndex from onboundary is start of current word
-        const before = content.slice(0, highlightIndex);
-        const after = content.slice(highlightIndex);
-
-        return (
-            <div className="text-sm whitespace-pre-wrap">
-                <span className="opacity-60 transition-opacity duration-300">{before}</span>
-                <span className="font-bold text-white transition-all duration-300 bg-blue-500/20 box-decoration-clone px-0.5 rounded shadow-[0_0_10px_rgba(59,130,246,0.5)]">
-                    {after.split(' ')[0]}
-                </span>
-                <span className="text-gray-300">{after.slice(after.split(' ')[0].length)}</span>
-            </div>
-        );
     };
 
     return (
@@ -229,40 +131,17 @@ export default function ChatPanel({ messages, onSendMessage, isLoading = false }
                         <h3 className="font-semibold text-white tracking-wide">AI Interviewer</h3>
                     </div>
                     <div className="flex items-center gap-1.5 mt-1">
-                        <div className={`w-1.5 h-1.5 rounded-full ${isVoiceMode ? 'bg-green-500 animate-pulse' : 'bg-gray-600'}`} />
+                        <div className={`w-1.5 h-1.5 rounded-full ${isListening ? 'bg-red-500 animate-pulse' : 'bg-green-500'}`} />
                         <p className="text-xs text-gray-400">
-                            {isVoiceMode ? (isListening ? "Listening..." : isSpeaking ? "Speaking..." : "Voice Active") : "Text Mode"}
+                            {isListening ? "🎙️ Listening..." : "Azure TTS • Browser STT"}
                         </p>
                     </div>
                 </div>
-
-                <button
-                    onClick={toggleVoiceMode}
-                    className={cn(
-                        "p-2.5 rounded-full transition-all duration-300 shadow-lg",
-                        isVoiceMode
-                            ? "bg-red-500/10 text-red-400 hover:bg-red-500/20 ring-1 ring-red-500/50"
-                            : "bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white"
-                    )}
-                    title={isVoiceMode ? "Stop Voice Mode" : "Start Voice Mode"}
-                >
-                    {isVoiceMode ? (
-                        isListening ? (
-                            <div className="relative">
-                                <span className="absolute -top-1 -right-1 w-2 h-2 bg-red-500 rounded-full animate-ping" />
-                                <Mic className="w-5 h-5" />
-                            </div>
-                        ) : <Volume2 className="w-5 h-5 animate-pulse" />
-                    ) : (
-                        <MicOff className="w-5 h-5" />
-                    )}
-                </button>
             </div>
 
             {/* Messages */}
             <div className="flex-1 overflow-y-auto p-4 space-y-6 scrollbar-thin scrollbar-thumb-gray-800 scrollbar-track-transparent">
                 {messages.map((message, index) => {
-                    const isLast = index === messages.length - 1;
                     const isAssistant = message.role === 'assistant';
                     const isError = message.content.includes("Error:") || message.content.includes("trouble connecting");
 
@@ -282,11 +161,7 @@ export default function ChatPanel({ messages, onSendMessage, isLoading = false }
                                         </div>
                                     ) : (
                                         <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center shadow-lg shadow-blue-900/20">
-                                            {isSpeaking && isLast && isVoiceMode ? (
-                                                <Volume2 className="w-4 h-4 text-white animate-pulse" />
-                                            ) : (
-                                                <Bot className="w-4 h-4 text-white" />
-                                            )}
+                                            <Bot className="w-4 h-4 text-white" />
                                         </div>
                                     )}
                                 </div>
@@ -306,7 +181,7 @@ export default function ChatPanel({ messages, onSendMessage, isLoading = false }
                             >
                                 {isError && <div className="flex items-center gap-2 mb-2 text-red-400 font-bold text-xs uppercase tracking-wider"><AlertCircle className="w-3 h-3" /> Error</div>}
 
-                                {renderMessageContent(message.content, isAssistant && isSpeaking && isLast)}
+                                <div className="text-sm whitespace-pre-wrap">{message.content}</div>
 
                                 <div className="text-[10px] opacity-40 mt-1.5 flex justify-end font-medium tracking-wide">{formatTime(message.timestamp)}</div>
                             </div>
@@ -344,37 +219,41 @@ export default function ChatPanel({ messages, onSendMessage, isLoading = false }
             {/* Input */}
             <form onSubmit={handleSubmit} className="p-4 bg-gray-900/95 border-t border-gray-800 backdrop-blur">
                 <div className="flex gap-3 items-center">
-                    <div className="relative">
-                        <button
-                            type="button"
-                            onClick={toggleVoiceMode}
-                            className={cn(
-                                "p-3 rounded-xl transition-all duration-300 flex-shrink-0 z-10 relative",
-                                isVoiceMode
-                                    ? "bg-red-500/10 text-red-400 ring-1 ring-red-500/50"
-                                    : "bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white"
+                    {/* Speak Button - Browser Speech Recognition */}
+                    {speechSupported && (
+                        <div className="relative">
+                            <button
+                                type="button"
+                                onClick={toggleListening}
+                                disabled={isLoading}
+                                className={cn(
+                                    "p-3 rounded-xl transition-all duration-300 flex-shrink-0 z-10 relative",
+                                    isListening
+                                        ? "bg-red-500 text-white ring-2 ring-red-400"
+                                        : "bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white"
+                                )}
+                                title={isListening ? "Stop Listening" : "Click to Speak (auto-sends after you stop)"}
+                            >
+                                {isListening ? (
+                                    <Mic className="w-5 h-5 animate-pulse" />
+                                ) : (
+                                    <Mic className="w-5 h-5" />
+                                )}
+                            </button>
+                            {isListening && (
+                                <div className="absolute -inset-1 rounded-xl bg-red-500/20 blur-sm animate-pulse z-0" />
                             )}
-                            title={isVoiceMode ? "Stop Voice Mode" : "Start Voice Mode"}
-                        >
-                            {isListening ? (
-                                <Mic className="w-5 h-5 animate-pulse" />
-                            ) : (
-                                <MicOff className="w-5 h-5" />
-                            )}
-                        </button>
-                        {isListening && (
-                            <div className="absolute -inset-1 rounded-xl bg-red-500/20 blur-sm animate-pulse z-0" />
-                        )}
-                    </div>
+                        </div>
+                    )}
 
                     <input
                         type="text"
                         value={inputValue}
                         onChange={(e) => setInputValue(e.target.value)}
-                        placeholder={isVoiceMode ? (isListening ? "Listening... (Speak now)" : "Voice Active (Waiting...)") : "Type your message..."}
+                        placeholder={isListening ? "Listening... speak now" : "Type or click mic to speak..."}
                         className={cn(
                             "flex-1 bg-gray-950 border border-gray-800 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500/50 transition-all",
-                            isListening && "border-blue-500/30 ring-1 ring-blue-500/20"
+                            isListening && "border-red-500/30 ring-1 ring-red-500/20"
                         )}
                         disabled={isLoading}
                     />
@@ -386,6 +265,13 @@ export default function ChatPanel({ messages, onSendMessage, isLoading = false }
                         <Send className="w-5 h-5 text-white" />
                     </button>
                 </div>
+
+                {/* Listening indicator */}
+                {isListening && (
+                    <div className="mt-2 text-center text-sm text-red-400 animate-pulse">
+                        🎙️ Listening... (auto-sends 1.5s after you stop speaking)
+                    </div>
+                )}
             </form>
         </div>
     );

@@ -9,53 +9,6 @@ from typing import Dict, Any
 from app.config import settings
 from app.models.session import CodeExecution
 
-# Test cases for different problems
-PROBLEM_TESTS = {
-    "two-sum": """
-const { twoSum } = require('./solution.js');
-
-const testCases = [
-    { nums: [2, 7, 11, 15], target: 9, expected: [0, 1] },
-    { nums: [3, 2, 4], target: 6, expected: [1, 2] },
-    { nums: [3, 3], target: 6, expected: [0, 1] },
-    { nums: [1, 5, 3, 7, 9], target: 12, expected: [2, 4] },
-    { nums: [-1, -2, -3, -4, -5], target: -8, expected: [2, 4] }
-];
-
-let passed = 0;
-let failed = 0;
-
-testCases.forEach((test, i) => {
-    try {
-        const result = twoSum(test.nums, test.target);
-        
-        // Check if result is correct (order doesn't matter)
-        const isCorrect = (
-            result.length === 2 &&
-            test.nums[result[0]] + test.nums[result[1]] === test.target &&
-            result[0] !== result[1]
-        );
-        
-        if (isCorrect) {
-            console.log(`✓ Test ${i + 1} passed`);
-            passed++;
-        } else {
-            console.error(`✗ Test ${i + 1} failed: Expected indices where nums[i] + nums[j] = ${test.target}, got [${result}]`);
-            failed++;
-        }
-    } catch (error) {
-        console.error(`✗ Test ${i + 1} failed with error: ${error.message}`);
-        failed++;
-    }
-});
-
-console.log(`\\n${passed}/${testCases.length} tests passed`);
-
-if (failed > 0) {
-    process.exit(1);
-}
-"""
-}
 
 class Judge0Service:
     """Service for executing code via Judge0 API"""
@@ -73,6 +26,29 @@ class Judge0Service:
             self.headers["X-RapidAPI-Key"] = self.api_key
             self.headers["X-RapidAPI-Host"] = "judge0-ce.p.rapidapi.com"
     
+    def _get_test_code_for_problem(self, problem_id: str) -> str:
+        """Get test code for a problem from the problem service"""
+        from app.services.problem_service import get_problem_service
+        
+        problem_service = get_problem_service()
+        problem = problem_service.get_problem(problem_id)
+        
+        if problem:
+            return problem_service.generate_test_code(problem)
+        
+        return ""
+    
+    def _get_export_name(self, problem_id: str) -> str:
+        """Get the function name to export based on problem ID"""
+        export_names = {
+            "two-sum": "twoSum",
+            "reverse-string": "reverseString",
+            "valid-palindrome": "isPalindrome",
+            "maximum-subarray": "maxSubArray",
+            "merge-sorted-arrays": "merge",
+        }
+        return export_names.get(problem_id, problem_id.replace("-", ""))
+    
     async def execute_code(self, source_code: str, problem_id: str) -> CodeExecution:
         """
         Execute JavaScript code with test cases
@@ -85,25 +61,36 @@ class Judge0Service:
             CodeExecution model with results
         """
         
-        # Get test cases for the problem
-        test_code = PROBLEM_TESTS.get(problem_id, "")
+        # Get test cases dynamically from problem service
+        test_code = self._get_test_code_for_problem(problem_id)
         
         if not test_code:
             return CodeExecution(
                 status="error",
-                stderr="No test cases found for this problem",
+                stderr=f"No test cases found for problem: {problem_id}",
                 test_passed=False,
                 test_total=0
             )
         
-        # Wrap source code with module.exports for CommonJS
-        wrapped_code = f"{source_code}\n\nmodule.exports = {{ twoSum }};"
+        # Get the correct export name for this problem
+        export_name = self._get_export_name(problem_id)
         
-        # Prepare submission
+        # Combine solution code with test code
+        # Remove the require statement from test code since we're combining them
+        test_code_inline = test_code.replace(f"const {{ {export_name} }} = require('./solution.js');", "")
+        
+        # Create full code: solution + test
+        full_code = f"""// Solution
+{source_code}
+
+// Tests
+{test_code_inline}
+"""
+        
+        # Prepare submission - combine everything into source_code
         submission_data = {
             "language_id": 63,  # JavaScript (Node.js)
-            "source_code": base64.b64encode(wrapped_code.encode()).decode(),
-            "additional_files": base64.b64encode(test_code.encode()).decode(),
+            "source_code": base64.b64encode(full_code.encode()).decode(),
             "stdin": "",
             "expected_output": ""
         }

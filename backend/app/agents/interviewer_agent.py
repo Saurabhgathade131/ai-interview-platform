@@ -98,7 +98,7 @@ Your Goal: Assess the candidate's problem-solving skills while providing a suppo
                 model=self.deployment,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=500,
+                max_completion_tokens=500,
                 stream=True  # Enable streaming
             )
             
@@ -109,18 +109,18 @@ Your Goal: Assess the candidate's problem-solving skills while providing a suppo
                         yield delta.content
         except Exception as e:
             print(f"AI Stream Error ({type(e).__name__}): {str(e)}")
-            # Fallback message if stream fails entirely
-            yield f"I am having trouble connecting to the AI model ({str(e)}). Please try again."
-            if "insufficient_quota" in str(e):
-                raise Exception("OpenAI API Quota Exceeded. Please check your billing.")
-            elif "Incorrect API key" in str(e) or "401" in str(e):
-                raise Exception("Invalid OpenAI API Key. Please update .env")
-            else:
-                raise e
+            # Fallback to Mock Response (sent as a single chunk)
+            mock_resp = self._get_mock_response(user_message, context, error=str(e))
+            yield mock_resp
+            
+            # Optional: Add small delay to simulate thinking if needed
+            # import asyncio
+            # await asyncio.sleep(0.5)
 
     async def send_message(self, user_message: str, context: Dict[str, Any]) -> str:
         """
-        Send a message to the AI interviewer and get a full response (Legacy/Reference)
+        Send a message to the AI interviewer and get a full response
+        Falls back to Mock AI if connection fails
         """
         try:
             messages = [
@@ -132,16 +132,38 @@ Your Goal: Assess the candidate's problem-solving skills while providing a suppo
                 model=self.deployment,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=500
+                max_completion_tokens=500
             )
             
             return response.choices[0].message.content
             
         except Exception as e:
             print(f"AI Agent error: {str(e)}")
-            if "insufficient_quota" in str(e):
-                return "Error: OpenAI API Quota Exceeded. Please check your billing."
-            return "I apologize, but I'm having trouble responding right now. Please try asking your question again."
+            # Graceful Fallback (Mock AI)
+            return self._get_mock_response(user_message, context, error=str(e))
+
+    def _get_mock_response(self, user_message: str, context: Dict[str, Any], error: str = "") -> str:
+        """
+        Provide a simulated response when AI is offline
+        """
+        msg = user_message.lower()
+        
+        # 1. Hint Request
+        if "hint" in msg or "stuck" in msg or "help" in msg:
+            if context.get('recent_errors'):
+                return f"I see you're encountering an error: `{context['recent_errors']}`. \n\n**Hint:** Try checking your logic around that line. Usually, this happens when you access an index out of bounds or mistype a variable name."
+            return "Sure! **Hint:** For the Two Sum problem, consider using a Hash Map (Object in JS) to store numbers you've already seen. This allows you to look up the complement in O(1) time."
+            
+        # 2. Solution/Code related
+        if "solution" in msg or "code" in msg:
+            return "I'd love to help, but I can't write the code for you! Try starting with a loop to iterate through the array. What would you do inside the loop?"
+            
+        # 3. Connection Error Explanation
+        if "connection" in msg or "why" in msg:
+            return f"I'm operating in **Offline Mode** right now because I couldn't connect to the AI model. \n*(Error: {error})*\n\nPlease make sure Ollama is running (`ollama run llama3.2`) or your API keys are set in `.env`."
+            
+        # 4. Default Chat functionality
+        return "That's a great question. Since I'm currently running in **Offline Mode** (AI connection failed), I can only give basic hints. \n\nTry asking for a **hint** about the Two Sum problem!"
     
     async def proactive_hint(self, context: Dict[str, Any]) -> str:
         """
@@ -163,7 +185,7 @@ Keep it concise and supportive!"""
                 model=self.deployment,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=200
+                max_completion_tokens=200
             )
             
             return response.choices[0].message.content
@@ -191,7 +213,7 @@ Format your response as JSON with keys: time_complexity, space_complexity, quali
                 model=self.deployment,
                 messages=messages,
                 temperature=0.3,  # Lower temperature for more consistent analysis
-                max_tokens=600
+                max_completion_tokens=600
             )
             
             # Try to parse JSON response

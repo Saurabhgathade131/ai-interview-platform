@@ -13,8 +13,10 @@ import MonacoEditor from '@/components/Editor/MonacoEditor';
 import TabManager from '@/components/Editor/TabManager';
 import OutputConsole from '@/components/Console/OutputConsole';
 import ChatPanel from '@/components/Chat/ChatPanel';
+import AgentStatus, { AgentState } from '@/components/Agent/AgentStatus';
 
 import { socketClient, joinSession, sendCodeUpdate, sendChatMessage, sendProctoringEvent } from '@/lib/socket';
+import { textToSpeech, stopSpeech } from '@/lib/speech';
 import { ChatMessage, ExecutionResult, SessionData, Tab } from '@/types';
 
 export default function InterviewPage() {
@@ -36,6 +38,18 @@ export default function InterviewPage() {
     const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
     const [isExecuting, setIsExecuting] = useState(false);
     const [isChatLoading, setIsChatLoading] = useState(false);
+    const [agentState, setAgentState] = useState<AgentState>('idle');
+
+    // Interview phase: 'waiting' = waiting for user to click start, 'started' = interview in progress
+    const [interviewPhase, setInterviewPhase] = useState<'waiting' | 'started'>('waiting');
+    const [isAISpeaking, setIsAISpeaking] = useState(false);
+
+    // Proctoring state
+    const [tabSwitchCount, setTabSwitchCount] = useState(0);
+    const [pasteCount, setPasteCount] = useState(0);
+    const [showWarningModal, setShowWarningModal] = useState(false);
+    const [warningMessage, setWarningMessage] = useState('');
+    const [isFullscreen, setIsFullscreen] = useState(false);
 
     // Initialize WebSocket connection
     useEffect(() => {
@@ -51,7 +65,7 @@ export default function InterviewPage() {
             setConnected(false);
         });
 
-        newSocket.on('session_joined', (data: SessionData) => {
+        newSocket.on('session_joined', (data: SessionData & { speak_welcome?: boolean }) => {
             console.log('Session joined:', data);
             setSessionData(data);
             setTabs((prev) =>
@@ -60,6 +74,7 @@ export default function InterviewPage() {
                 )
             );
             setChatMessages(data.chat_history);
+            // TTS will be triggered when user clicks "Start Interview" button
         });
 
         newSocket.on('execution_started', () => {
@@ -149,18 +164,14 @@ if (failed > 0) process.exit(1);`;
         newSocket.on('chat_response', (message: ChatMessage & { speak?: boolean }) => {
             setChatMessages((prev) => [...prev, message]);
             setIsChatLoading(false);
+            setAgentState('idle');  // Reset agent state after response
 
-            // Auto-speak AI responses if voice flag is set
+            // Auto-speak AI responses using Azure TTS
             if (message.speak && message.role === 'assistant' && message.content) {
-                try {
-                    const utterance = new SpeechSynthesisUtterance(message.content);
-                    utterance.rate = 1.0;
-                    utterance.pitch = 1.0;
-                    utterance.volume = 1.0;
-                    window.speechSynthesis.speak(utterance);
-                } catch (error) {
-                    console.warn('Text-to-speech not supported:', error);
-                }
+                // Use Azure TTS (falls back to browser TTS if unavailable)
+                textToSpeech(message.content, true).catch(error => {
+                    console.warn('TTS failed:', error);
+                });
             }
         });
 
@@ -184,31 +195,118 @@ if (failed > 0) process.exit(1);`;
         };
     }, [sessionId]);
 
-    // Proctoring: Tab visibility
+    // Proctoring: Tab visibility - show warning when tab is switched
     useEffect(() => {
         const handleVisibilityChange = () => {
-            if (document.hidden && socket) {
-                sendProctoringEvent(socket, 'tab_switch', { timestamp: Date.now() });
-            }
-        };
-        document.addEventListener('visibilitychange', handleVisibilityChange);
-        return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-    }, [socket]);
+            if (document.hidden && interviewPhase === 'started') {
+                const newCount = tabSwitchCount + 1;
+                setTabSwitchCount(newCount);
 
-    // Proctoring: Paste detection
-    useEffect(() => {
-        const handlePaste = (e: Event) => {
-            const customEvent = e as CustomEvent;
-            if (socket && customEvent.detail) {
-                sendProctoringEvent(socket, 'paste_detected', {
-                    length: customEvent.detail.length,
-                    timestamp: Date.now(),
-                });
+                if (socket) {
+                    sendProctoringEvent(socket, 'tab_switch', {
+                        timestamp: Date.now(),
+                        count: newCount
+                    });
+                }
+
+                // Show warning modal
+                if (newCount >= 3) {
+                    setWarningMessage(`⚠️ FINAL WARNING: You have switched tabs ${newCount} times. One more violation and you will be DISQUALIFIED from this interview.`);
+                } else {
+                    setWarningMessage(`⚠️ WARNING: Tab switch detected (${newCount}/3). Switching tabs during the interview is not allowed and may result in disqualification.`);
+                }
+                setShowWarningModal(true);
             }
         };
-        window.addEventListener('paste-detected', handlePaste);
-        return () => window.removeEventListener('paste-detected', handlePaste);
-    }, [socket]);
+
+        const handleFullscreenChange = () => {
+            if (!document.fullscreenElement && interviewPhase === 'started') {
+                // User exited fullscreen during interview - show warning
+                setWarningMessage('⚠️ WARNING: Fullscreen mode is required during the interview. Please remain in fullscreen mode to avoid disqualification.');
+                setShowWarningModal(true);
+                setIsFullscreen(false);
+            }
+        };
+
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        document.addEventListener('fullscreenchange', handleFullscreenChange);
+
+        return () => {
+            document.removeEventListener('visibilitychange', handleVisibilityChange);
+            document.removeEventListener('fullscreenchange', handleFullscreenChange);
+        };
+    }, [socket, interviewPhase, tabSwitchCount]);
+
+    // Proctoring: Paste detection with warning
+    useEffect(() => {
+        const handlePaste = (e: ClipboardEvent) => {
+            if (interviewPhase === 'started') {
+                const pastedText = e.clipboardData?.getData('text') || '';
+                const newCount = pasteCount + 1;
+                setPasteCount(newCount);
+
+                if (socket) {
+                    sendProctoringEvent(socket, 'paste_detected', {
+                        length: pastedText.length,
+                        timestamp: Date.now(),
+                        count: newCount
+                    });
+                }
+
+                // Show warning for paste
+                if (pastedText.length > 50) {
+                    setWarningMessage(`⚠️ WARNING: Large paste detected (${pastedText.length} characters). Pasting code from external sources is being monitored. Paste count: ${newCount}`);
+                    setShowWarningModal(true);
+                }
+            }
+        };
+
+        document.addEventListener('paste', handlePaste);
+        return () => document.removeEventListener('paste', handlePaste);
+    }, [socket, interviewPhase, pasteCount]);
+
+    // Start Interview - triggers AI greeting with TTS
+    // Enter fullscreen mode
+    const enterFullscreen = async () => {
+        try {
+            await document.documentElement.requestFullscreen();
+            setIsFullscreen(true);
+        } catch (error) {
+            console.warn('Fullscreen request failed:', error);
+        }
+    };
+
+    // Exit fullscreen
+    const exitFullscreen = () => {
+        if (document.fullscreenElement) {
+            document.exitFullscreen();
+            setIsFullscreen(false);
+        }
+    };
+
+    const startInterview = async () => {
+        // Enter fullscreen mode first
+        await enterFullscreen();
+
+        setInterviewPhase('started');
+        setIsAISpeaking(true);
+
+        // AI Introduction greeting
+        const voiceGreeting = `Hello and welcome to your technical interview! I'm your AI Interviewer today, powered by advanced artificial intelligence technology. Before we begin with the coding problem, I'd love to hear a bit about yourself. Please take a moment to introduce yourself - tell me about your background, your experience, and what excites you most about software development. You can speak or type your response.`;
+
+        // Wait 500ms then play TTS
+        setTimeout(async () => {
+            try {
+                console.log('Starting AI introduction TTS...');
+                await textToSpeech(voiceGreeting, true);
+                console.log('AI introduction TTS completed');
+                setIsAISpeaking(false);
+            } catch (error) {
+                console.warn('AI introduction TTS failed:', error);
+                setIsAISpeaking(false);
+            }
+        }, 500);
+    };
 
     const handleCodeChange = (code: string) => {
         setTabs((prev) =>
@@ -246,14 +344,10 @@ if (failed > 0) process.exit(1);`;
                     timestamp: new Date().toISOString()
                 }]);
 
-                // Speak the AI message
-                try {
-                    const utterance = new SpeechSynthesisUtterance(randomMessage);
-                    utterance.rate = 1.0;
-                    window.speechSynthesis.speak(utterance);
-                } catch (error) {
-                    console.warn('Text-to-speech failed:', error);
-                }
+                // Speak the AI message using Azure TTS
+                textToSpeech(randomMessage, true).catch(error => {
+                    console.warn('Azure TTS failed:', error);
+                });
             }
         }, 10000);
         return () => clearInterval(interval);
@@ -270,6 +364,10 @@ if (failed > 0) process.exit(1);`;
 
     const handleRunCode = async () => {
         if (!connected || isExecuting) return;
+
+        // Stop any AI speech when user runs code (user interrupt)
+        stopSpeech();
+
         setIsExecuting(true);
         setConsoleOutputs((prev) => [...prev, { type: 'system', text: '⏳ Running code (via Secure API)...', timestamp: new Date() }]);
         const solutionCode = tabs.find((t) => t.id === 'solution')?.content || '';
@@ -308,6 +406,7 @@ if (failed > 0) process.exit(1);`;
             const userMessage: ChatMessage = { role: 'user', content: message, timestamp: new Date().toISOString() };
             setChatMessages((prev) => [...prev, userMessage]);
             setIsChatLoading(true);
+            setAgentState('thinking');  // Show agent is processing
             sendChatMessage(socket, message);
         }
     };
@@ -317,6 +416,84 @@ if (failed > 0) process.exit(1);`;
 
     return (
         <div className="h-[100dvh] flex flex-col bg-gray-950 text-white overflow-hidden">
+            {/* Start Interview Overlay */}
+            {interviewPhase === 'waiting' && sessionData && (
+                <div className="absolute inset-0 z-50 bg-gray-950/95 backdrop-blur-sm flex items-center justify-center">
+                    <div className="bg-gray-900 border border-gray-700 rounded-2xl p-8 max-w-lg mx-4 text-center shadow-2xl">
+                        <div className="w-20 h-20 bg-gradient-to-br from-blue-600 to-purple-600 rounded-full flex items-center justify-center mx-auto mb-6">
+                            <span className="text-4xl">🎙️</span>
+                        </div>
+                        <h2 className="text-2xl font-bold mb-4">Ready to Start Your Interview?</h2>
+                        <p className="text-gray-400 mb-6">
+                            Your AI Interviewer will introduce themselves and ask you to share a bit about your background before presenting the coding challenge.
+                        </p>
+                        <p className="text-sm text-gray-500 mb-6">
+                            <strong>Problem:</strong> {sessionData.problem_title} • <strong>Duration:</strong> 45 minutes
+                        </p>
+                        <button
+                            onClick={startInterview}
+                            className="w-full bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white font-semibold py-4 px-8 rounded-xl transition-all transform hover:scale-105 flex items-center justify-center gap-3 text-lg"
+                        >
+                            <Play className="w-6 h-6" />
+                            Start Interview
+                        </button>
+                        <p className="text-xs text-gray-500 mt-4">
+                            🔊 Audio will play - ensure your speakers are on
+                        </p>
+                    </div>
+                </div>
+            )}
+
+            {/* AI Speaking Indicator */}
+            {isAISpeaking && (
+                <div className="absolute top-20 left-1/2 transform -translate-x-1/2 z-40 bg-blue-600/90 text-white px-4 py-2 rounded-full flex items-center gap-2 shadow-lg">
+                    <div className="w-3 h-3 bg-white rounded-full animate-pulse"></div>
+                    <span className="text-sm font-medium">AI Interviewer is speaking...</span>
+                </div>
+            )}
+
+            {/* Proctoring Warning Modal */}
+            {showWarningModal && (
+                <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+                    <div className="bg-gray-900 border-2 border-red-500 rounded-2xl p-8 max-w-md text-center shadow-2xl animate-in zoom-in-95 duration-200">
+                        <div className="w-16 h-16 bg-red-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
+                            <span className="text-4xl">⚠️</span>
+                        </div>
+                        <h2 className="text-xl font-bold text-red-400 mb-4">Proctoring Alert</h2>
+                        <p className="text-gray-300 mb-6 leading-relaxed">
+                            {warningMessage}
+                        </p>
+                        <div className="space-y-3">
+                            <button
+                                onClick={() => {
+                                    setShowWarningModal(false);
+                                    enterFullscreen();
+                                }}
+                                className="w-full bg-red-600 hover:bg-red-700 text-white font-semibold py-3 px-6 rounded-xl transition-all"
+                            >
+                                I Understand - Return to Interview
+                            </button>
+                            <div className="text-xs text-gray-500">
+                                Tab Switches: {tabSwitchCount}/3 • Pastes: {pasteCount}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Proctoring Status Bar */}
+            {interviewPhase === 'started' && (
+                <div className="absolute top-0 right-0 m-2 z-30 flex items-center gap-2 bg-gray-900/90 px-3 py-1.5 rounded-full border border-gray-700 text-xs">
+                    <div className={`w-2 h-2 rounded-full ${isFullscreen ? 'bg-green-500' : 'bg-yellow-500 animate-pulse'}`}></div>
+                    <span className="text-gray-400">
+                        {isFullscreen ? 'Proctored' : 'Not Fullscreen'}
+                    </span>
+                    {tabSwitchCount > 0 && (
+                        <span className="text-red-400 font-medium">• {tabSwitchCount} warnings</span>
+                    )}
+                </div>
+            )}
+
             {/* Header */}
             <header className="h-16 flex-shrink-0 bg-gray-900 border-b border-gray-700 flex items-center justify-between px-4 lg:px-6 z-10">
                 <div className="flex items-center gap-3">
@@ -332,6 +509,9 @@ if (failed > 0) process.exit(1);`;
                         <Clock className="w-4 h-4" />
                         <span>45:00</span>
                     </div>
+
+                    {/* Agent Status Indicator */}
+                    <AgentStatus state={agentState} className="hidden md:flex" />
 
                     <div className="flex items-center gap-2">
                         {connected ? (

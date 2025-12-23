@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     AZURE_OPENAI_DEPLOYMENT: str = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
     AZURE_OPENAI_API_VERSION: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
     
+    # Azure Speech Services (TTS/STT)
+    AZURE_SPEECH_KEY: str = os.getenv("AZURE_SPEECH_KEY", "")
+    AZURE_SPEECH_REGION: str = os.getenv("AZURE_SPEECH_REGION", "eastus")
+    
     # Standard OpenAI Configuration (Fallback)
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     

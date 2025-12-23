@@ -15,10 +15,10 @@ from app.models.session import (
 )
 from app.config import settings
 
-# Create Socket.io server
+# Create Socket.io server - Allow all origins for development
 sio = socketio.AsyncServer(
     async_mode='asgi',
-    cors_allowed_origins=settings.CORS_ORIGINS,
+    cors_allowed_origins="*",  # Allow all origins
     logger=True,
     engineio_logger=True
 )
@@ -49,54 +49,44 @@ async def disconnect(sid):
 async def join_session(sid, data):
     """
     Join an interview session
-    Expected data: { session_id: str, candidate_name?: str }
+    Expected data: { session_id: str, candidate_name?: str, experience_years?: int }
     """
     session_id = data.get('session_id')
-    candidate_name = data.get('candidate_name', 'Anonymous')
+    candidate_name = data.get('candidate_name', 'Candidate')
+    experience_years = data.get('experience_years', 2)  # Default to junior level
     
     print(f"Client {sid} joining session {session_id}")
     
     # Create or retrieve session
     if session_id not in active_sessions:
-        # Initialize new session with a sample problem
+        # Get dynamic problem based on experience level
+        from app.services.problem_service import get_problem_service
+        problem_service = get_problem_service()
+        
+        # Select a random problem appropriate for the candidate's level
+        problem = problem_service.get_random_problem(experience_years=experience_years)
+        
+        # Generate the welcome message with problem description
+        welcome_content = problem_service.format_problem_for_chat(problem, candidate_name)
+        
+        # Initialize new session with the selected problem
         active_sessions[session_id] = InterviewSession(
             session_id=session_id,
             candidate_name=candidate_name,
-            problem_id="two-sum",
-            problem_title="Two Sum",
+            problem_id=problem.problem_id,
+            problem_title=problem.title,
             status=SessionStatus.IN_PROGRESS,
             started_at=datetime.utcnow(),
-            current_code="""// Write a function that takes an array of numbers and a target
-// Return indices of two numbers that add up to the target
-
-function twoSum(nums, target) {
-    // Your code here
-    
-}
-"""
+            current_code=problem.initial_code
         )
+        
+        # Store the problem reference for test generation
+        active_sessions[session_id].problem = problem
         
         # Add welcome message from AI interviewer
         welcome_message = ChatMessage(
             role="assistant",
-            content=f"""Hello {candidate_name}! 👋
-
-I'm your AI interviewer today. Let me explain the problem:
-
-**Two Sum Problem:**
-Given an array of integers `nums` and an integer `target`, return the indices of the two numbers that add up to the target.
-
-**Example:**
-- Input: nums = [2, 7, 11, 15], target = 9
-- Output: [0, 1] (because nums[0] + nums[1] = 2 + 7 = 9)
-
-**Constraints:**
-- Each input has exactly one solution
-- You cannot use the same element twice
-
-Feel free to ask me any clarifying questions! When you're ready, write your solution in the editor and click "Run Code" to test it.
-
-Good luck! 🚀""",
+            content=welcome_content,
             timestamp=datetime.utcnow()
         )
         active_sessions[session_id].chat_history.append(welcome_message)
@@ -117,11 +107,13 @@ Good luck! 🚀""",
             {
                 'role': msg.role,
                 'content': msg.content,
-                'timestamp': msg.timestamp.isoformat()
+                'timestamp': msg.timestamp.isoformat(),
+                'speak': True  # Enable TTS for welcome message
             }
             for msg in session.chat_history
         ],
-        'status': session.status
+        'status': session.status,
+        'speak_welcome': True  # Flag to auto-speak welcome message
     }, room=sid)
 
 @sio.event
@@ -215,11 +207,90 @@ async def run_code(sid, data):
             'memory': result.memory
         }, room=sid)
         
+        # AI Interviewer responds naturally based on execution result
+        await send_ai_execution_feedback(sid, session, result, code)
+        
     except Exception as e:
         print(f"Execution error: {str(e)}")
         await sio.emit('execution_error', {
             'error': str(e)
         }, room=sid)
+
+
+async def send_ai_execution_feedback(sid: str, session, result, code: str):
+    """Send natural AI interviewer response based on code execution results"""
+    try:
+        # Build context for AI
+        context = {
+            "problem_id": session.problem_id,
+            "problem_title": session.problem_title,
+            "current_code": code,
+            "test_passed": result.test_passed,
+            "test_total": result.test_total,
+            "stdout": result.stdout or "",
+            "stderr": result.stderr or "",
+            "consecutive_errors": session.consecutive_errors,
+            "execution_time": result.time
+        }
+        
+        # Construct the prompt for AI based on result
+        if result.test_passed:
+            # All tests passed - congratulate!
+            prompt = f"""The candidate just ran their code for {session.problem_title} and ALL TESTS PASSED! 🎉
+
+Respond like a real interviewer would:
+1. Congratulate them briefly
+2. Ask 1-2 follow-up questions about:
+   - Time/space complexity of their solution
+   - Alternative approaches they considered
+   - How they would handle edge cases
+
+Keep response conversational and under 100 words. Be encouraging!"""
+        else:
+            # Tests failed - provide helpful feedback
+            error_info = result.stderr if result.stderr else result.stdout
+            prompt = f"""The candidate just ran their code for {session.problem_title} and got errors.
+
+Error output: {error_info[:500] if error_info else "Tests failed"}
+
+Consecutive errors: {session.consecutive_errors}
+
+Respond like a supportive interviewer:
+1. Acknowledge the attempt briefly
+2. Give ONE specific hint based on the error (don't reveal the solution)
+3. Encourage them to try again
+
+Keep response under 80 words. Be helpful, not condescending."""
+        
+        # Get AI response
+        if settings.AZURE_OPENAI_API_KEY and settings.AZURE_OPENAI_ENDPOINT:
+            from app.agents.sk_agent import SemanticKernelInterviewerAgent
+            agent = SemanticKernelInterviewerAgent(socket_to_session[sid])
+            ai_response = await agent.send_message(prompt, context)
+        else:
+            from app.agents.interviewer_agent import InterviewerAgent
+            agent = InterviewerAgent(socket_to_session[sid])
+            ai_response = await agent.send_message(prompt, context)
+        
+        # Store and send AI response
+        ai_message = ChatMessage(
+            role="assistant",
+            content=ai_response,
+            timestamp=datetime.utcnow()
+        )
+        session.chat_history.append(ai_message)
+        
+        # Emit to client with speak flag for TTS
+        await sio.emit('chat_response', {
+            'role': 'assistant',
+            'content': ai_response,
+            'timestamp': ai_message.timestamp.isoformat(),
+            'speak': True  # Enable TTS for this response
+        }, room=sid)
+        
+    except Exception as e:
+        print(f"AI feedback error: {str(e)}")
+        # Don't crash if AI feedback fails - the execution result already sent
 
 @sio.event
 async def chat_message(sid, data):
@@ -248,13 +319,19 @@ async def chat_message(sid, data):
     
     # Get AI response
     try:
-        # Try to use Microsoft Semantic Kernel Agent first
-        try:
-            from app.agents.sk_agent import SemanticKernelInterviewerAgent
-            print("Using Microsoft Semantic Kernel Agent")
-            agent = SemanticKernelInterviewerAgent(session_id)
-        except ImportError as e:
-            print(f"Semantic Kernel not found ({e}), falling back to standard agent.")
+        # SELECT AGENT STRATEGY
+        # If Azure keys are present, use the advanced Semantic Kernel Agent
+        if settings.AZURE_OPENAI_API_KEY and settings.AZURE_OPENAI_ENDPOINT:
+            try:
+                from app.agents.sk_agent import SemanticKernelInterviewerAgent
+                print("🚀 Using Microsoft Semantic Kernel Agent (Azure Configured)")
+                agent = SemanticKernelInterviewerAgent(session_id)
+            except Exception as e:
+                print(f"⚠️ Failed to load Semantic Kernel ({e}). Falling back to Standard Agent.")
+                from app.agents.interviewer_agent import InterviewerAgent
+                agent = InterviewerAgent(session_id)
+        else:
+            # Fallback / Local LLM Mode
             from app.agents.interviewer_agent import InterviewerAgent
             agent = InterviewerAgent(session_id)
         

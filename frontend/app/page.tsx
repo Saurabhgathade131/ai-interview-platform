@@ -97,11 +97,6 @@ export default function HomePage() {
               Start Interview
             </button>
           </div>
-
-          <div className="mt-6 text-center text-sm text-gray-400">
-            <p>Problem: Two Sum</p>
-            <p className="mt-1">Difficulty: Medium • Time: 45 minutes</p>
-          </div>
         </div>
 
         {/* Footer */}
